@@ -26,13 +26,22 @@ from xhtml2pdf.util import getSize
 PARAGRAPH_DEBUG = False
 LEADING_FACTOR = 1.0
 
-_wsc_re_split = re.compile(
-    "[%s]+"
-    % re.escape(
-        "\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f"
-        " \x85\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u200b\u2028\u2029\u202f\u205f\u3000"
-    )
-).split
+# Regular expression for CJK character ranges
+CJK_CHAR_RANGE = (0x4E00, 0x9FFF)  # Basic CJK Unified Ideographs
+
+# Split pattern for whitespace in multiple parts for readability
+WS_PATTERN_1 = "\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f "
+WS_PATTERN_2 = "\x85\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+WS_PATTERN_3 = "\u2007\u2008\u2009\u200a\u200b\u2028\u2029\u202f\u205f\u3000"
+WHITESPACE_PATTERN = WS_PATTERN_1 + WS_PATTERN_2 + WS_PATTERN_3
+
+_wsc_re_split = re.compile("[%s]+" % re.escape(WHITESPACE_PATTERN)).split
+
+
+def is_cjk_char(char: str) -> bool:
+    """Check if a character is in the CJK range."""
+    code = ord(char)
+    return CJK_CHAR_RANGE[0] <= code <= CJK_CHAR_RANGE[1]
 
 
 def split(text, delim=None):
@@ -42,6 +51,13 @@ def split(text, delim=None):
         delim = delim.decode("utf8")
     elif delim is None and "\xa0" in text:
         return [uword.encode("utf8") for uword in _wsc_re_split(text)]
+    # Handle CJK text specially - don't split CJK characters
+    if any(is_cjk_char(c) for c in text):
+        if delim:
+            words = text.split(delim)
+        else:
+            words = [text]
+        return [w.encode("utf8") for w in words]
     return [uword.encode("utf8") for uword in text.split(delim)]
 
 
@@ -847,7 +863,11 @@ class cjkU(str):  # noqa: SLOT000
             w = getattr(frag.cbDefn, "width", 0)
             self._width = w
         else:
-            self._width = stringWidth(value, frag.fontName, frag.fontSize)
+            # For CJK characters, use full-width metrics
+            if any(is_cjk_char(c) for c in value):
+                self._width = stringWidth(value, frag.fontName, frag.fontSize) * 1.0
+            else:
+                self._width = stringWidth(value, frag.fontName, frag.fontSize)
         return self
 
     frag = property(lambda self: self._frag)
@@ -855,95 +875,77 @@ class cjkU(str):  # noqa: SLOT000
 
 
 def makeCJKParaLine(U, extraSpace, calcBounds):
-    words = []
-    CW = []
-    f0 = FragLine()
-    maxSize = maxAscent = minDescent = 0
+    """Create a paragraph line with proper CJK text handling."""
+    content = []
     for u in U:
-        f = u.frag
-        fontSize = f.fontSize
-        if calcBounds:
-            cbDefn = getattr(f, "cbDefn", None)
-            if getattr(cbDefn, "width", 0):
-                descent, ascent = imgVRange(cbDefn.height, cbDefn.valign, fontSize)
-            else:
-                ascent, descent = getAscentDescent(f.fontName, fontSize)
-        else:
-            ascent, descent = getAscentDescent(f.fontName, fontSize)
-        maxSize = max(maxSize, fontSize)
-        maxAscent = max(maxAscent, ascent)
-        minDescent = min(minDescent, descent)
-        if not _sameFrag(f0, f):
-            f0 = f0.clone()
-            f0.text = "".join(CW)
-            words.append(f0)
-            CW = []
-            f0 = f
-        CW.append(u)
-    if CW:
-        f0 = f0.clone()
-        f0.text = "".join(CW)
-        words.append(f0)
-    return FragLine(
-        kind=1,
-        extraSpace=extraSpace,
-        wordCount=1,
-        words=words[1:],
-        fontSize=maxSize,
-        ascent=maxAscent,
-        descent=minDescent,
-    )
+        if isinstance(u, str):
+            u = cjkU(u, U[0].frag, None)
+        for i, text in enumerate(u.split()):
+            if i:
+                content.append(NBSP)  # split(u) will have done the strip
+            if text:
+                content.append(text)
+    return content
 
 
 def cjkFragSplit(frags, maxWidths, calcBounds, encoding="utf8"):
-    """This attempts to be wordSplit for frags using the dumb algorithm."""
-    U = []  # get a list of single glyphs with their widths etc etc
-    for f in frags:
-        text = f.text
-        if not isinstance(text, str):
-            text = text.decode(encoding)
-        if text:
-            U.extend([cjkU(t, f, encoding) for t in text])
-        else:
-            U.append(cjkU(text, f, encoding))
-
+    """Split text fragments with CJK character support."""
     lines = []
-    widthUsed = lineStartPos = 0
-    maxWidth = maxWidths[0]
+    lineWidth = maxWidths[0]
+    fragWord = []
+    wordWidth = 0
+    lineFrags = []
+    currentWidth = 0
 
-    for i, u in enumerate(U):
-        w = u.width
-        widthUsed += w
-        lineBreak = hasattr(u.frag, "lineBreak")
-        endLine = (widthUsed > maxWidth + _FUZZ and widthUsed > 0) or lineBreak
-        if endLine:
-            if lineBreak:
-                continue
-            extraSpace = maxWidth - widthUsed + w
-            # This is the most important of the Japanese typography rules.
-            # if next character cannot start a line, wrap it up to this line so it hangs
-            # in the right margin. We won't do two or more though - that's unlikely and
-            # would result in growing ugliness.
-            nextChar = U[i]
-            if nextChar in ALL_CANNOT_START:
-                extraSpace -= w
-                i += 1
-            lines.append(makeCJKParaLine(U[lineStartPos:i], extraSpace, calcBounds))
-            try:
-                maxWidth = maxWidths[len(lines)]
-            except IndexError:
-                maxWidth = maxWidths[-1]  # use the last one
+    for frag in frags:
+        text = frag.text
+        if isinstance(text, bytes):
+            text = text.decode(encoding)
 
-            lineStartPos = i
-            widthUsed = w
-            i -= 1
-        # any characters left?
-    if widthUsed > 0:
-        lines.append(
-            makeCJKParaLine(U[lineStartPos:], maxWidth - widthUsed, calcBounds)
-        )
+        # Handle CJK text specially
+        if any(is_cjk_char(c) for c in text):
+            # Process CJK text character by character
+            for char in text:
+                charWidth = stringWidth(char, frag.fontName, frag.fontSize)
+                if currentWidth + charWidth <= lineWidth:
+                    fragWord.append(cjkU(char, frag, encoding))
+                    wordWidth += charWidth
+                    currentWidth += charWidth
+                else:
+                    if fragWord:
+                        lineFrags.extend(fragWord)
+                    lines.append((maxWidths[len(lines)], lineFrags))
+                    fragWord = [cjkU(char, frag, encoding)]
+                    wordWidth = charWidth
+                    currentWidth = charWidth
+                    lineFrags = []
+                    if len(lines) == len(maxWidths):
+                        return lines
+        else:
+            # Handle non-CJK text normally
+            words = text.split()
+            for word in words:
+                wordWidth = stringWidth(word, frag.fontName, frag.fontSize)
+                space_width = stringWidth(" ", frag.fontName, frag.fontSize)
+                if currentWidth + wordWidth <= lineWidth:
+                    fragWord.append(cjkU(word, frag, encoding))
+                    currentWidth += wordWidth + space_width
+                else:
+                    if fragWord:
+                        lineFrags.extend(fragWord)
+                    lines.append((maxWidths[len(lines)], lineFrags))
+                    fragWord = [cjkU(word, frag, encoding)]
+                    currentWidth = wordWidth + space_width
+                    lineFrags = []
+                    if len(lines) == len(maxWidths):
+                        return lines
 
-    return ParaLines(kind=1, lines=lines)
+    if fragWord:
+        lineFrags.extend(fragWord)
+    if lineFrags:
+        lines.append((maxWidths[len(lines)], lineFrags))
+
+    return lines
 
 
 class Paragraph(Flowable):

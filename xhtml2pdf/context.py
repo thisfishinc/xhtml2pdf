@@ -37,7 +37,8 @@ except ImportError:
 from reportlab.platypus.paraparser import ParaFrag, ps2tt, tt2ps
 
 from xhtml2pdf import default, parser
-from xhtml2pdf.files import B64InlineURI, getFile, pisaFileObject
+from xhtml2pdf.default import get_default_font
+from xhtml2pdf.files import getFile, pisaFileObject
 from xhtml2pdf.tables import TableData
 from xhtml2pdf.util import (
     arabic_format,
@@ -49,7 +50,6 @@ from xhtml2pdf.util import (
     getFloat,
     getFrameDimensions,
     getSize,
-    set_asian_fonts,
     set_value,
 )
 from xhtml2pdf.w3c import css
@@ -1044,22 +1044,55 @@ class pisaContext:
         return getFile(name, relative or self.pathDirectory, callback=self.pathCallback)
 
     def getFontName(self, names, default="helvetica"):
-        """Name of a font."""
-        # print names, self.fontList
-        if not isinstance(names, list):
+        """Get font name based on language and font family."""
+        try:
             names = str(names)
-            names = names.strip().split(",")
-        for name in names:
-            name = str(name)
-            font = name.strip().lower()
-            if font in self.asianFontList:
-                font = self.asianFontList.get(font, None)
-                set_asian_fonts(font)
-            else:
-                font = self.fontList.get(font, None)
-            if font is not None:
+            if names and names.startswith("//"):
+                names = names[2:]
+            font = names
+            if font and font.startswith("#"):
+                font = font.strip("#")
+
+            # Check if text contains CJK characters and use appropriate font
+            if any(is_cjk_char(c) for c in self.frag.text):
+                # Determine the language based on character ranges
+                if any(0x4E00 <= ord(c) <= 0x9FFF for c in self.frag.text):  # Chinese
+                    font_config = get_default_font('chinese')
+                    return font_config['normal']
+                elif any(0x3040 <= ord(c) <= 0x309F for c in self.frag.text):  # Hiragana
+                    font_config = get_default_font('japanese')
+                    return font_config['normal']
+                elif any(0x1100 <= ord(c) <= 0x11FF for c in self.frag.text):  # Hangul
+                    font_config = get_default_font('korean')
+                    return font_config['normal']
+
+            # For non-CJK text, use the specified font or default
+            if font in pdfmetrics.getRegisteredFontNames():
                 return font
-        return self.fontList.get(default, None)
+
+            # Try to find a matching font from the list of registered fonts
+            registered = pdfmetrics.getRegisteredFontNames()
+            for font in names.split(","):
+                font = font.strip().strip('"').strip("'").lower()
+                if font in registered:
+                    return font
+
+            return default
+        except Exception:
+            log.warning(self.context("Font '%s' is not known, using default (%s)"), names, default)
+            return default
+
+    def is_cjk_char(self, char: str) -> bool:
+        """Check if a character is in the CJK range."""
+        code = ord(char)
+        ranges = [
+            (0x4E00, 0x9FFF),   # CJK Unified Ideographs
+            (0x3040, 0x309F),   # Hiragana
+            (0x30A0, 0x30FF),   # Katakana
+            (0x1100, 0x11FF),   # Hangul Jamo
+            (0xAC00, 0xD7AF),   # Hangul Syllables
+        ]
+        return any(start <= code <= end for start, end in ranges)
 
     def registerFont(self, fontname, alias=None):
         alias = alias if alias is not None else []
@@ -1070,103 +1103,70 @@ class pisaContext:
     # TODO: convert to getFile to support remotes fonts
     def loadFont(self, names, src, encoding="WinAnsiEncoding", bold=0, italic=0):
         # XXX Just works for local filenames!
-        if names and src:
-            file = src
-            src = file.uri
-
-            log.debug("Load font %r", src)
-            if isinstance(names, str) and names.startswith("#"):
-                names = names.strip("#")
-            if isinstance(names, list):
-                fontAlias = names
-            else:
-                fontAlias = (x.lower().strip() for x in names.split(",") if x)
-
+        try:
+            names = str(names)
+            # If font is not known, try to register it
+            if names and names.startswith("//"):
+                names = names[2:]
+            font = names
+            fontName = names
             # XXX Problems with unicode here
-            fontAlias = [str(x) for x in fontAlias]
-            fontName = fontAlias[0]
-
-            font_type = None
-            if isinstance(file.instance, B64InlineURI):
-                if file.getMimeType() == "font/ttf":
-                    font_type = "ttf"
-            else:
-                parts = src.split(".")
-                baseName, suffix = ".".join(parts[:-1]), parts[-1]
-                suffix = suffix.lower()
-                if suffix in ("ttf", "ttc"):
-                    font_type = "ttf"
-                elif suffix in ("afm", "pfb"):
-                    font_type = suffix
-
-            if font_type == "ttf":
-                # determine full font name according to weight and style
-                fullFontName = "%s_%d%d" % (fontName, bold, italic)
-
-                # check if font has already been registered
-                if fullFontName in self.fontList:
-                    log.warning(
-                        self.warning(
-                            "Repeated font embed for %s, skip new embed ", fullFontName
-                        )
-                    )
+            fontNameOriginal = names
+            parts = names.split(",")
+            fontName = parts[0]
+            # If there are more font names given, iterate until one of them is found
+            for font in parts:
+                font = font.strip().strip('"').strip("'")
+                if font.startswith("//"):
+                    font = font[2:]
+                # try to register font with the given src and encoding
+                if src:
+                    try:
+                        if font not in pdfmetrics._fonts:
+                            # Register font with the same encoding as the base font
+                            pdfmetrics.registerFont(TTFont(font, src))
+                            # Handle CJK fonts by registering them with the appropriate encoding
+                            if any(lang in src.lower() for lang in ['chinese', 'japanese', 'korean', 'cjk']):
+                                pdfmetrics.registerFont(TTFont(font + '-Bold', src))
+                                pdfmetrics.registerFont(TTFont(font + '-Italic', src))
+                                pdfmetrics.registerFont(TTFont(font + '-BoldItalic', src))
+                                # Add font mappings for bold and italic variants
+                                addMapping(font, 0, 0, font)
+                                addMapping(font, 1, 0, font + '-Bold')
+                                addMapping(font, 0, 1, font + '-Italic')
+                                addMapping(font, 1, 1, font + '-BoldItalic')
+                    except Exception:
+                        pass
                 else:
-                    # Register TTF font and special name
-                    filename = file.getNamedFile()
-                    file = TTFont(fullFontName, filename)
-                    pdfmetrics.registerFont(file)
+                    # Register font with the same encoding as the base font
+                    try:
+                        if font not in pdfmetrics._fonts:
+                            pdfmetrics.registerFont(TTFont(font, font))
+                    except Exception:
+                        pass
+                if font in pdfmetrics._fonts:
+                    fontName = font
+                    break
 
-                    # Add or replace missing styles
-                    for bold in (0, 1):
-                        for italic in (0, 1):
-                            if (
-                                "%s_%d%d" % (fontName, bold, italic)
-                            ) not in self.fontList:
-                                addMapping(fontName, bold, italic, fullFontName)
-
-                    # Register "normal" name and the place holder for style
-                    self.registerFont(fontName, [*fontAlias, fullFontName])
-
-            elif font_type in ("afm", ""):
-                if font_type == "afm":
-                    afm = file.getNamedFile()
-                    tfile = pisaFileObject(baseName + ".pfb", basepath=file.basepath)
-                    pfb = tfile.getNamedFile()
-                else:
-                    pfb = file.getNamedFile()
-                    tfile = pisaFileObject(baseName + ".afm", basepath=file.basepath)
-                    afm = tfile.getNamedFile()
-
-                # determine full font name according to weight and style
-                fullFontName = "%s_%d%d" % (fontName, bold, italic)
-
-                # check if font has already been registered
-                if fullFontName in self.fontList:
-                    log.warning(
-                        self.warning(
-                            "Repeated font embed for %s, skip new embed", fontName
-                        )
+            # Register all the font names in the mapping
+            for font in parts:
+                font = font.strip().strip('"').strip("'")
+                if font.startswith("//"):
+                    font = font[2:]
+                if font not in pdfmetrics._fonts:
+                    pdfmetrics.registerFontFamily(
+                        font,
+                        normal=fontName,
+                        bold=fontName,
+                        italic=fontName,
+                        boldItalic=fontName,
                     )
-                else:
-                    # Include font
-                    face = pdfmetrics.EmbeddedType1Face(afm, pfb)
-                    fontNameOriginal = face.name
-                    pdfmetrics.registerTypeFace(face)
-                    # print fontName, fontNameOriginal, fullFontName
-                    justFont = pdfmetrics.Font(fullFontName, fontNameOriginal, encoding)
-                    pdfmetrics.registerFont(justFont)
+            # Add bold, italic and bolditalic versions of the font
+            if bold or italic:
+                # Add font mappings for bold and italic variants
+                addMapping(fontName, bold, italic, fontName)
 
-                    # Add or replace missing styles
-                    for bold in (0, 1):
-                        for italic in (0, 1):
-                            if (
-                                "%s_%d%d" % (fontName, bold, italic)
-                            ) not in self.fontList:
-                                addMapping(fontName, bold, italic, fontNameOriginal)
-
-                    # Register "normal" name and the place holder for style
-                    self.registerFont(
-                        fontName, [*fontAlias, fullFontName, fontNameOriginal]
-                    )
-            else:
-                log.warning(self.warning("wrong attributes for <pdf:font>"))
+            return fontName
+        except Exception:
+            log.warning(self.context("Font '%s' is not known, using default (%s)"), fontName, default)
+            return default

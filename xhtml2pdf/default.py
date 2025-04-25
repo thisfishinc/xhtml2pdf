@@ -693,6 +693,39 @@ DEFAULT_FONT = {
     "geneva": "Helvetica",
 }
 
+# Default CJK fonts
+DEFAULT_FONT_CONFIGS = {
+    'chinese': {
+        'normal': 'STSong-Light',
+        'bold': 'STSong-Light',
+        'italic': 'STSong-Light',
+        'bold_italic': 'STSong-Light',
+    },
+    'japanese': {
+        'normal': 'HeiseiMin-W3',
+        'bold': 'HeiseiKakuGo-W5',
+        'italic': 'HeiseiMin-W3',
+        'bold_italic': 'HeiseiKakuGo-W5',
+    },
+    'korean': {
+        'normal': 'HYSMyeongJo-Medium',
+        'bold': 'HYGothic-Medium',
+        'italic': 'HYSMyeongJo-Medium',
+        'bold_italic': 'HYGothic-Medium',
+    }
+}
+
+def get_default_font(language=None):
+    """Get the default font configuration based on language."""
+    if language and language.lower() in DEFAULT_FONT_CONFIGS:
+        return DEFAULT_FONT_CONFIGS[language.lower()]
+    return {
+        'normal': DEFAULT_FONT['normal'],
+        'bold': DEFAULT_FONT['bold'],
+        'italic': DEFAULT_FONT['italic'],
+        'bold_italic': DEFAULT_FONT['bold_italic'],
+    }
+
 PML_PAGESIZES = {
     "a0": A0,
     "a1": A1,
